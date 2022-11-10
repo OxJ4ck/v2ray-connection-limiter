@@ -1,73 +1,103 @@
-from glob import glob
-import os;
-import sqlite3;
-import time;
-import requests;
-import subprocess;
-import threading;
-import schedule;
-_db_address = '/etc/x-ui/x-ui.db'
-_max_allowed_connections = 1
-_user_last_id = 0
-_telegrambot_token = ''
-_telegram_chat_id = '' # you can get this in @cid_bot bot.
-def getUsers():
-    global _user_last_id
-    conn = sqlite3.connect(_db_address)
-    cursor = conn.execute(f"select id,remark,port from inbounds where id > {_user_last_id}");
-    users_list = [];
-    for c in cursor:
-        users_list.append({'name':c[1],'port':c[2]})
-        _user_last_id = c[0];
-    conn.close();
-    return users_list
+"""v2ray connection limiter"""
+import os
+import sqlite3
+from time import sleep
 
-def disableAccount(user_port):
-    conn = sqlite3.connect(_db_address) 
-    conn.execute(f"update inbounds set enable = 0 where port={user_port}");
-    conn.commit()
-    conn.close();
-    time.sleep(2)
+import requests
+import schedule
+
+import config
+
+
+def restart_x_ui():
+    """restart x-ui to apply the changes"""
     os.popen("x-ui restart")
-    time.sleep(3)
-    
-def checkNewUsers():
-    conn = sqlite3.connect(_db_address)
-    cursor = conn.execute(f"select count(*) from inbounds WHERE id > {_user_last_id}");
-    new_counts = cursor.fetchone()[0];
-    conn.close();
-    if new_counts > 0:
-        init()
 
-def init():
-    users_list = getUsers();
+
+def get_users() -> list:
+    """get all saved users in database
+
+    Returns:
+        list: remark and port of users
+    """
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("select remark,port from inbounds")
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def disable_account(user_port: str) -> None:
+    """restrict account access
+
+    Args:
+        user_port (str): port number of user
+    """
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.execute(f"update inbounds set enable = 0 where port={user_port}")
+    conn.commit()
+    conn.close()
+
+
+def send_to_telegram(user_remark: str) -> None:
+    """send alert message to admin
+
+    Args:
+        user_remark (str): name of account
+    """
+    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage"
+    params = {
+        "chat_id": config.CHAT_ID,
+        "text": user_remark + " has been blocked.",
+    }
+    requests.get(url, params=params, timeout=10)
+
+
+def checker(user: dict) -> bool:
+    """check user for active connection
+
+    Args:
+        user (dict): user to check
+
+    Returns:
+        bool: True if the number of connection is more than the maximum allowed, otherwise False
+    """
+    user_remark = user["remark"]
+    user_port = user["port"]
+    netstat_data = os.popen(
+        "netstat -np 2>/dev/null | grep :"
+        + str(user_port)
+        + " | awk '{if($3!=0) print $5;}' | cut -d: -f1 | sort | uniq -c | sort -nr | head"
+    ).read()
+    netstat_data = str(netstat_data)
+    connection_count = len(netstat_data.split("\n")) - 1
+    if config.PRINT_OUTPUT:
+        print(f"{user_remark:<12}{user_port:<12}{connection_count:<12}")
+    if connection_count > config.MAX_ALLOWED_CONNECTIONS:
+        disable_account(user_port=user_port)
+        send_to_telegram(user_remark=user_remark)
+        if config.PRINT_OUTPUT:
+            print(f"inbound with port {user_port} blocked")
+        return True
+    return False
+
+
+def run():
+    """run the script"""
+    need_restart = False
+    users_list = get_users()
+    if config.PRINT_OUTPUT:
+        print(f"{'Remark':<12}{'Port':<12}{'Count':<12}")
     for user in users_list:
-        thread = AccessChecker(user)
-        thread.start()
-        print("starting checker for : " + user['name'])
-class AccessChecker(threading.Thread):
-    def __init__(self, user):
-        threading.Thread.__init__(self)
-        self.user = user;
-    def run(self):
-        #global _max_allowed_connections; <<if you get variable error uncomment this.
-        user_remark = self.user['name'];
-        user_port = self.user['port'];
-        while True:
-            netstate_data =  os.popen("netstat -np 2>/dev/null | grep :"+str(user_port)+" | awk '{if($3!=0) print $5;}' | cut -d: -f1 | sort | uniq -c | sort -nr | head").read();
-            netstate_data = str(netstate_data)
-            connection_count =  len(netstate_data.split("\n")) - 1;
-            #print("c "+str(user_port) + "-"+ str(connection_count))
-            if connection_count > _max_allowed_connections:
-                user_remark = user_remark.replace(" ","%20")
-                requests.get(f'https://api.telegram.org/bot{_telegrambot_token}/sendMessage?chat_id={_telegram_chat_id}&text={user_remark}%20locked')
-                disableAccount(user_port=user_port)
-                print(f"inbound with port {user_port} blocked")
-            else:
-                time.sleep(2)
+        if checker(user=user):
+            need_restart = True
 
-init();
-schedule.every(10).minutes.do(checkNewUsers)
+    if need_restart:
+        restart_x_ui()
+
+
+schedule.every(config.INTERVAL).seconds.do(run)
+
 while True:
     schedule.run_pending()
-    time.sleep(1)
+    sleep(1)
